@@ -1,0 +1,24 @@
+dsh-file-quote
+MIT License — Copyright (c) 2026 Sunday2Mo
+
+Third-party attribution
+=======================
+
+- dsh-quote-annotate
+  https://github.com/wangwei-wade/dsh-quote-annotate
+  MIT License — Copyright (c) 2026 wangwei-wade
+
+  The BASE chat-message quoting flow (selection → annotate → quote block
+  serialization, including the `> ` block format and the 「引用#N」 chip
+  pipeline) derives from this project.
+
+  The following are ORIGINAL additions of dsh-file-quote:
+    - Sidebar file quoting: quoting the detailed content of files previewed
+      in the sidebar, with the file path and exact line range embedded in
+      the quote block, for every file type the sidebar can preview or edit.
+    - Persistent collapse in BOTH the composer and the sent conversation
+      history (the quote block stays collapsed on the user side while the
+      AI still receives the full text and source).
+    - Click-to-jump-back: locating and highlighting the quoted position in
+      the file (editor locate + highlight, message-row scroll + flash, or a
+      file-source overlay fallback).

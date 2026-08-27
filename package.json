@@ -1,0 +1,61 @@
+{
+  "name": "dsh-file-quote",
+  "version": "0.1.0",
+  "description": "Unified quoting for DeepSeek Harness Web: select file-editor text or chat messages → annotate → 「引用#N」chip → the AI receives a formatted quote block with file path and exact line range (source line hidden on the user side); sent quotes collapse into a hoverable chip that jumps back to the original text. 统一引用插件（文件编辑器 + 会话消息）。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "plugin",
+    "quote",
+    "selection",
+    "annotate",
+    "reference",
+    "editor",
+    "file",
+    "codex"
+  ],
+  "license": "MIT",
+  "author": "Sunday2Mo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sunday2Mo/dsh-file-quote.git"
+  },
+  "homepage": "https://github.com/Sunday2Mo/dsh-file-quote#readme",
+  "bugs": {
+    "url": "https://github.com/Sunday2Mo/dsh-file-quote/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "prepare": "npm run build",
+    "prepack": "npm run build"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README_EN.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dependencies": {
+    "react": "^18.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}
