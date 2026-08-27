@@ -102,6 +102,10 @@ npm run build   # src/ → lib/（npm 安装 / GitHub 安装 / 打包时经 prep
 
 **只改 `src/`，不要手改 `lib/`**：改完先 `npm run build`，再硬刷新浏览器调试 client；host 改动（`src/index.js`）需重启 `dsh web`。
 
-## License
+## ⚖️ 第三方致谢
 
-MIT —— 见 [LICENSE](./LICENSE) 与 [NOTICE](./NOTICE)（第三方归属：dsh-quote-annotate）。
+插件部分设计源自 [dsh-quote-annotate](https://github.com/wangwei-wade/dsh-quote-annotate)（MIT License，Copyright (c) 2026 wangwei-wade）。
+
+## 许可证
+
+MIT

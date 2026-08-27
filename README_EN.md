@@ -103,6 +103,10 @@ npm run build   # src/ → lib/ (runs automatically via prepare on npm/GitHub in
 
 **Edit only `src/`, never `lib/` by hand**: after changing `src/`, run `npm run build`, then hard-refresh the browser to debug the client; restart `dsh web` after host-half changes (`src/index.js`).
 
+## ⚖️ Third-party attribution
+
+Part of the plugin's design derives from [dsh-quote-annotate](https://github.com/wangwei-wade/dsh-quote-annotate) (MIT License, Copyright (c) 2026 wangwei-wade).
+
 ## License
 
-MIT — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE) (third-party attribution: dsh-quote-annotate).
+MIT
