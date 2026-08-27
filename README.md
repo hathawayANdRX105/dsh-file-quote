@@ -100,10 +100,6 @@ npm run build   # src/ → lib/（npm 安装 / GitHub 安装 / 打包时经 prep
 
 **只改 `src/`，不要手改 `lib/`**：改完先 `npm run build`，再硬刷新浏览器调试 client；host 改动（`src/index.js`）需重启 `dsh web`。
 
-## 多语言
-
-界面文案当前为**中文**；序列化协议格式（`> `、`📄 引用来源`、`（第 X-Y 行）`）保持中文原样，保证与已发送旧引用块互相可解析。
-
 ## License
 
 MIT —— 见 [LICENSE](./LICENSE) 与 [NOTICE](./NOTICE)（第三方归属：dsh-quote-annotate）。

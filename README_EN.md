@@ -101,10 +101,6 @@ npm run build   # src/ → lib/ (runs automatically via prepare on npm/GitHub in
 
 **Edit only `src/`, never `lib/` by hand**: after changing `src/`, run `npm run build`, then hard-refresh the browser to debug the client; restart `dsh web` after host-half changes (`src/index.js`).
 
-## i18n
-
-The UI copy is currently **Chinese**; the serialization protocol (`> `, `📄 引用来源`, `（第 X-Y 行）`) stays in Chinese verbatim so new and already-sent quote blocks parse the same way.
-
 ## License
 
 MIT — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE) (third-party attribution: dsh-quote-annotate).
