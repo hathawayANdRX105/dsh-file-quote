@@ -37,15 +37,17 @@ DeepSeek Harness Web **0.1.x**（client 使用 `slots` / `inputTriggers` 服务�
 
 ```bash
 # 1. 先安装 dsh-better-sidebar（完整功能依赖）
+dsh plugin --profile web add dsh-better-sidebar@latest   # 首次会因 pnpm 11 拦截 node-pty 构建脚本而失败（依赖已写入）
+cd ~/.dsh/profiles/web && pnpm approve-builds --all      # 放行构建脚本（自动重跑安装）
+dsh plugin --profile web add dsh-better-sidebar@latest   # 重跑即成功
+#装完硬刷新浏览器（Cmd/Ctrl+Shift+R）即可看到侧边栏（DSH 对 client 改动热加载，无需重启；仅 host 半更新时需要重启）。
 
-# 2. 再安装本插件（通过 npm，发布后）
+# 2. 再安装本插件
+# 从 npm 安装（推荐）：
 dsh plugin --profile web add dsh-file-quote
 
-# 或从 GitHub 源码安装本插件
-dsh plugin --profile web add "github:Sunday2Mo/dsh-file-quote"
-
-# 本地开发
-dsh plugin --profile web add "link:/path/to/dsh-file-quote"
+# 本地开发（link: 热更新）
+dsh plugin --profile web add "link:your path/dsh-file-quote"
 ```
 
 装完硬刷新浏览器（Cmd/Ctrl+Shift+R）；host 半改动需重启 `dsh web`。

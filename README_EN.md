@@ -37,15 +37,17 @@ DeepSeek Harness Web **0.1.x** (the client uses the `slots` / `inputTriggers` se
 
 ```bash
 # 1. Install dsh-better-sidebar first (the full feature set depends on it)
+dsh plugin --profile web add dsh-better-sidebar@latest   # first run fails: pnpm 11 blocks node-pty build scripts (the dependency is still written)
+cd ~/.dsh/profiles/web && pnpm approve-builds --all      # allow the build scripts (re-runs the install automatically)
+dsh plugin --profile web add dsh-better-sidebar@latest   # re-run succeeds
+# After install, hard-refresh the browser (Cmd/Ctrl+Shift+R) to see the sidebar (DSH hot-reloads client changes; only host-half updates need a restart).
 
-# 2. Then install this plugin (via npm, once published)
+# 2. Then install this plugin
+# Install from npm (recommended)
 dsh plugin --profile web add dsh-file-quote
 
-# or straight from the GitHub source
-dsh plugin --profile web add "github:Sunday2Mo/dsh-file-quote"
-
-# local development
-dsh plugin --profile web add "link:/path/to/dsh-file-quote"
+# Local development (link: hot update)
+dsh plugin --profile web add "link:your path/dsh-file-quote"
 ```
 
 Then hard-refresh the browser (Cmd/Ctrl+Shift+R); restart `dsh web` after host-half changes.
