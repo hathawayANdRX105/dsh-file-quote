@@ -31,7 +31,7 @@
 
 ## Prerequisites
 
-DeepSeek Harness Web **0.1.x** (the client uses the `slots` / `inputTriggers` services; input triggers degrade gracefully to plain-text insertion when absent). **[dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) is required for the full feature set**: the plugin's full functionality (sidebar file-content quoting, jump-back location highlight) depends on it — without it only chat-message quoting works and file quoting falls back to the source overlay. Requires DSH `0.1.0-rc.8` or newer.
+DeepSeek Harness Web **0.1.x / 0.2.x** (the client uses the `slots` / `inputTriggers` services; input triggers degrade gracefully to plain-text insertion when absent). Verified on DSH `0.2.0-rc.2`. **[dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) is required for the full feature set**: the plugin's full functionality (sidebar file-content quoting, jump-back location highlight) depends on it — without it only chat-message quoting works and file quoting falls back to the source overlay. Requires DSH `0.1.0-rc.8` or newer.
 
 ## Installation
 
@@ -51,6 +51,17 @@ dsh plugin --profile web add "link:your path/dsh-file-quote"
 ```
 
 Then hard-refresh the browser (Cmd/Ctrl+Shift+R); restart `dsh web` after host-half changes.
+
+### Updating
+
+```bash
+dsh plugin --profile web add dsh-file-quote@latest
+```
+
+Then **hard-refresh the browser** (Cmd/Ctrl+Shift+R). Client-half changes are hot-reloaded by DSH, so `dsh web` does not need a restart.
+
+> Quote blocks and composer chips already sent or already in the box are **snapshots taken at insert time** and cannot be repaired retroactively — re-select and insert once after upgrading to verify.
+> If nothing changed after upgrading, hard-refresh (Ctrl+F5) first to rule out cached old code.
 
 ## Usage
 

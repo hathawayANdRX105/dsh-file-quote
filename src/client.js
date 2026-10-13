@@ -1,4 +1,4 @@
-// dsh-file-quote v0.1.0 — Client 半区（浏览器）
+// dsh-file-quote v0.1.1 — Client 半区（浏览器）
 // 统一引用插件：合并 dsh-quote-annotate 的全部功能 + 文件编辑器选区引用。
 //
 // MIT License — Copyright (c) 2026 Sunday2Mo
@@ -34,6 +34,21 @@ window.__ModuleLoader__.load({
     let rootCtx = null
     let currentSessionId = null
     let refSeq = 0
+    // 最近一次指针位置：输入框 chip 的官方激活回调没有事件对象，用它兜底定位气泡
+    let lastPointerPos = null
+    // 最近一次「认不出选区来源」的祖先链（去重，避免刷屏）
+    let lastUnrecognizedSurface = null
+    // 调试开关（默认关闭）：置 true 时，认不出选区来源的界面会把祖先链写进引用正文，
+    // 便于为新界面补适配。正常发布/正常使用下必须保持 false —— 用户发出的引用里
+    // 不会出现任何诊断痕迹。
+    const DIAGNOSE_IN_QUOTE = false
+    // 引用 source 是否已注册（即时注册与 ctx.inject 迟到注册互斥，重复注册会抛错）
+    let quoteSourceRegistered = false
+    // 可点击/可悬停的引用 chip 三种形态：
+    //   [data-dsfq-quote]     已发送消息里被折叠出的 chip（属性自带全文与定位）
+    //   [data-composer-chip]  输入框内的引用节点（本版 harness：data-composer-chip="<source>"）
+    //   [data-occurrence]     输入框内的引用节点（旧版 harness：data-occurrence="<occurrenceId>"）
+    const CHIP_SELECTOR = '[data-dsfq-quote], [data-composer-chip], [data-occurrence]'
     let pipelineAvailable = null
     let toastTimer = null
     // 程序化高亮选区期间抑制批注工具条弹出（毫秒时间戳）
@@ -68,6 +83,7 @@ window.__ModuleLoader__.load({
         this.relPath = info.relPath || null
         this.anchorKey = info.anchorKey || null
         this.lineRange = info.lineRange || null
+        this.diag = info.diag || ''
         this.emit()
       },
       hide() {
@@ -98,6 +114,12 @@ window.__ModuleLoader__.load({
       open(item, rect) {
         this.item = item
         this.rect = rect
+        this.emit()
+      },
+      // 异步补全定位信息（如渲染型预览里反查出来的行区间）后刷新界面
+      update(patch) {
+        if (!this.item) return
+        this.item = Object.assign({}, this.item, patch)
         this.emit()
       },
       close() {
@@ -220,13 +242,43 @@ window.__ModuleLoader__.load({
       return { relPath, body: bodyLines.join('\n').trim(), lineRange }
     }
 
+    // 当前活动会话 id 的唯一取法。
+    // harness 的 sessions 列表快照没有 `current` 字段：官方两处权威实现都从
+    // `byId` 里挑 retainedBy.mainView > 0 的那一行
+    // （@deepseek-ai/dsh-client-ui-session 的 UiSession.publishMain，以及
+    //  dsh-client-ui-cordis 侧栏面板的 useSessions((s) => Object.values(s.byId).find(...))）。
+    // 这里同时兼容可能存在的 `current` 字段，两种形状都能取到。
+    function pickCurrentSessionId(snap) {
+      if (!snap) return undefined
+      if (typeof snap.current === 'string' && snap.current !== '') return snap.current
+      const byId = snap.byId
+      if (!byId) return undefined
+      const ids = Object.keys(byId)
+      for (let i = 0; i < ids.length; i++) {
+        const row = byId[ids[i]]
+        if (row && row.retainedBy && (row.retainedBy.mainView || 0) > 0) return ids[i]
+      }
+      return undefined
+    }
+
+    // 不依赖 slot props 的兜底：直接读 sessions 服务的列表快照
+    function currentSessionFallback() {
+      try {
+        const sessions = rootCtx ? rootCtx.get('sessions') : undefined
+        if (!sessions || !sessions.list || !sessions.list.getSnapshot) return undefined
+        return pickCurrentSessionId(sessions.list.getSnapshot())
+      } catch (e) {
+        return undefined
+      }
+    }
+
     // 当前活动会话的工作区根（已发送消息的折叠 chip 定位文件时的 cwd 兜底）
     function currentCwd() {
       try {
         const sessions = rootCtx ? rootCtx.get('sessions') : undefined
         if (!sessions || !sessions.list || !sessions.list.getSnapshot) return null
         const snap = sessions.list.getSnapshot()
-        const id = currentSessionId || snap.current
+        const id = currentSessionId || pickCurrentSessionId(snap)
         const s = snap.byId && snap.byId[id]
         return (s && s.cwd) || null
       } catch (e) {
@@ -258,29 +310,44 @@ window.__ModuleLoader__.load({
       return h.toString(36)
     }
 
-    // 把文本按「连续以 > 开头的行」切段：引用段与普通文本段交替（普通段原样保留）。
-    // 「> 📄 文件：」行视为新引用块的起点：多个紧邻的引用（无空行分隔）也能各自成段。
+    // 把文本按「连续以 > 开头的行」切段：引用段与普通文本段交替（普通段原样保留，含换行）。
+    // 分块标记必须与写入格式一致：
+    //   当前格式「> 📄 引用来源：…」是引用块的**末行** → 该行之后的下一行才是新块起点；
+    //   早期格式「> 📄 文件：…」是**首行** → 该行本身即新块起点。
+    // （原实现只按「文件：」在行首切块，遇到当前格式会把来源行切成第二个 chip。）
+    // 普通段按整段拼接保留原有换行，避免多行正文被折叠后挤成一行。
     function splitQuoteRuns(text) {
       const lines = String(text || '').split('\n')
       const parts = []
       let buf = []
-      const flush = () => {
+      let plain = []
+      const isSourceCurrent = (line) => /^\s*>\s*📄\s*引用来源[：:]/.test(line)
+      const isSourceLegacy = (line) => /^\s*>\s*📄\s*文件[：:]/.test(line)
+      const flushQuote = () => {
         if (buf.length === 0) return
         const raw = buf.join('\n')
         const quoteText = buf.map((l) => l.replace(/^\s*>\s?/, '')).join('\n').trim()
         parts.push(quoteText === '' ? { quote: false, text: raw } : { quote: true, text: raw, quoteText })
         buf = []
       }
+      const flushPlain = () => {
+        if (plain.length === 0) return
+        parts.push({ quote: false, text: plain.join('\n') })
+        plain = []
+      }
       for (const line of lines) {
         if (/^\s*>\s?/.test(line)) {
-          if (/^\s*>\s*📄\s*文件[：:]/.test(line) && buf.length > 0) flush()
+          const startNew = buf.length > 0 && (buf.some(isSourceCurrent) || isSourceLegacy(line))
+          if (startNew) flushQuote()
+          flushPlain()
           buf.push(line)
         } else {
-          flush()
-          parts.push({ quote: false, text: line })
+          flushQuote()
+          plain.push(line)
         }
       }
-      flush()
+      flushQuote()
+      flushPlain()
       return parts
     }
 
@@ -289,10 +356,27 @@ window.__ModuleLoader__.load({
       const rows = document.querySelectorAll('[data-chat-flow-kind="user"], [data-chat-flow-kind="steering"], [data-pending-steering]')
       for (const row of rows) {
         try {
-          // 气泡内的纯文本容器 = MessageText 渲染的 div（子节点全部是文本节点）
+          // 行级粗筛：不含引用行的行直接跳过。本函数挂在 document.body 的
+          // MutationObserver 上（流式回答时会频繁触发），先做一次行级判断，
+          // 避免对每个用户气泡都拼装整棵子树的 textContent。
+          if (!/^\s*>\s?/m.test(row.textContent || '')) continue
+          // 正文容器的取法不再假定「div + 全是文本节点」：
+          // 本版 harness 用 projectUserText 把用户正文包进 <span class="…plainRun">，
+          // 旧的 div 选择器永远匹配不到任何容器，折叠因此整体失效。
+          // 现在取「自身文本含引用行、且没有子元素也含引用行」的最深元素。
           const containers = []
-          for (const el of row.querySelectorAll('div')) {
-            if (el.children.length > 0 || el.childNodes.length === 0) continue
+          for (const el of row.querySelectorAll('*')) {
+            if (el.closest('[data-dsfq-quote]')) continue
+            const text = el.textContent
+            if (!text || !/^\s*>\s?/m.test(text)) continue
+            let childMatches = false
+            for (const child of el.children) {
+              if (/^\s*>\s?/m.test(child.textContent || '')) {
+                childMatches = true
+                break
+              }
+            }
+            if (childMatches) continue
             containers.push(el)
           }
           for (const el of containers) {
@@ -441,6 +525,81 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // 注册引用 source（只在服务可用时调用一次）。
+    //   codec.serialize  → 提交时把 chip 展开为完整引用正文（AI 侧可见全文）
+    //   openReference    → 点击输入框内的 chip 时由 harness 回调（官方 chip 激活钩子）
+    function registerQuoteSource(inputTriggers) {
+      if (quoteSourceRegistered || !inputTriggers || typeof inputTriggers.registerSource !== 'function') return null
+      quoteSourceRegistered = true
+      pipelineAvailable = true
+      return inputTriggers.registerSource({
+        trigger: '@',
+        name: 'file-quote-ref',
+        order: 101,
+        candidates: async () => [],
+        onPick: () => undefined,
+        codec: {
+          clipboardText: (ref) => (refCodecs.get(ref) ? refCodecs.get(ref).clipboardText : ''),
+          serialize: (ref) => Promise.resolve(refCodecs.get(ref) ? refCodecs.get(ref).body : ''),
+        },
+        openReference: (session, reference) => {
+          try {
+            const info = reference ? refTargets.get(reference.ref) : null
+            if (!info) return false
+            locateQuoteTarget(info, lastPointerPos)
+            return true
+          } catch (e) {
+            console.error('[file-quote] 点击输入框引用出错', e)
+            return false
+          }
+        },
+      })
+    }
+
+    // 统一的「点击 chip 定位原文」路由（输入框 chip / 已发送 chip 共用）
+    function locateQuoteTarget(info, pos) {
+      if (!info) {
+        showToast('该引用没有定位信息', pos, false)
+        return
+      }
+      if (info.relPath) {
+        locateFile({ relPath: info.relPath, text: info.body || info.text || '', cwd: info.cwd || currentCwd(), lineRange: info.lineRange || null }, pos)
+      } else if (info.anchorKey || info.body) {
+        locateMessage(info, pos)
+      } else {
+        showToast('该引用没有定位信息', pos, false)
+      }
+    }
+
+    // 从任意一种 chip DOM 解析出 { text, info }（悬停提示与点击定位共用）
+    function quoteInfoFromChip(el) {
+      if (!el) return null
+      if (el.hasAttribute('data-dsfq-quote')) {
+        const rangeAttr = el.getAttribute('data-dsfq-range') || ''
+        return {
+          text: el.getAttribute('data-dsfq-quote-text') || '',
+          info: {
+            relPath: el.getAttribute('data-dsfq-relpath') || null,
+            body: el.getAttribute('data-dsfq-body') || null,
+            anchorKey: el.getAttribute('data-dsfq-anchor') || null,
+            lineRange: rangeAttr ? rangeAttr.split(',').map(Number) : null,
+          },
+        }
+      }
+      // 输入框 chip：ref 编号编码在 chip 文案「引用内容 #N」里
+      const m = String(el.textContent || '').match(/#\s*(\d+)/)
+      if (m && refTargets.has('f' + m[1])) {
+        const info = refTargets.get('f' + m[1])
+        return { text: info.text || '', info }
+      }
+      const occAttr = el.getAttribute('data-occurrence')
+      if (occAttr !== null) {
+        const found = resolveOccurrence(Number(occAttr))
+        if (found && found.info) return { text: found.info.text || '', info: found.info }
+      }
+      return null
+    }
+
     // 从选区 DOM 向上找 workbench 编辑器容器的 data-path（CodeEditor 挂载点）
     function relPathFromHost(node) {
       if (!node || !node.closest) return null
@@ -494,6 +653,24 @@ window.__ModuleLoader__.load({
       return row ? row.getAttribute('data-chat-anchor-key') : null
     }
 
+    // 定位信息全无时打印选区的祖先链（用于识别尚未适配的界面）
+    function describeSurface(node) {
+      const out = []
+      let el = node && node.nodeType === 1 ? node : (node ? node.parentElement : null)
+      for (let i = 0; el && i < 6; i++) {
+        const cls = typeof el.className === 'string' && el.className !== '' ? '.' + el.className.trim().split(/\s+/).slice(0, 3).join('.') : ''
+        const attrs = []
+        const list = el.attributes || []
+        for (let j = 0; j < list.length; j++) {
+          const name = list[j].name
+          if (name.indexOf('data-') === 0) attrs.push(name)
+        }
+        out.push(String(el.tagName || '?').toLowerCase() + cls + (attrs.length > 0 ? '[' + attrs.join(',') + ']' : ''))
+        el = el.parentElement
+      }
+      return out.join(' < ')
+    }
+
     // ============ 编辑器内定位（直接操作 workbench 的 CodeMirror 实例） ============
     // CM6 通过 dom.cmTile 把 DOM 元素与 EditorView 关联（findFromDOM 内部即 tile.root.view），
     // 纯 DOM 属性即可拿到 view，无需 import workbench 内部类。
@@ -512,6 +689,9 @@ window.__ModuleLoader__.load({
       const abs = cwd ? joinAbs(cwd, relPath) : relPath
       const bsView = findBetterSidebarView(abs)
       if (bsView) return bsView
+      // 兜底：全文档按路径输入框找（原生标签页宿主里没有 [data-dsh-better-sidebar]）
+      const anyView = findViewByPathInput(abs)
+      if (anyView) return anyView
       return null
     }
 
@@ -624,7 +804,19 @@ window.__ModuleLoader__.load({
         }
         el = el.parentElement
       }
-      return null
+      // 兜底：类名/预览结构变化时，退化为「侧栏内最近一个带路径样 title 的输入框」，
+      // 再退化为「侧栏里唯一的那个路径输入框」（共享头部布局下选区祖先链上没有输入框）
+      el = editor.parentElement
+      while (el && el !== sidebarHost) {
+        if (el.querySelector) {
+          const inputs = el.querySelectorAll('input[title]')
+          for (const inp of inputs) {
+            if (isPathLikeTitle(String(inp.title || ''))) return inp.title
+          }
+        }
+        el = el.parentElement
+      }
+      return uniqueSidebarPath(sidebarHost)
     }
     function betterSidebarService() {
       try {
@@ -638,14 +830,115 @@ window.__ModuleLoader__.load({
     function relPathFromBetterSidebar(node) {
       try {
         if (!node || !node.closest) return null
-        const editor = node.closest('.cm-editor, [class*="editorCm"], [class*="editorMd"]')
-        if (!editor) return null
-        const host = editor.closest('[data-dsh-better-sidebar]')
+        const host = node.closest('[data-dsh-better-sidebar]')
         if (!host) return null
-        const abs = absPathForEditor(editor, host)
+        const editor = node.closest('.cm-editor, [class*="editorCm"], [class*="editorMd"]')
+        // 三路取路径：本窗口的路径输入框 → 祖先链上任意路径输入框 → 侧栏唯一路径输入框
+        let abs = editor ? absPathForEditor(editor, host) : null
+        if (!abs) abs = absPathFromSidebarAncestors(node, host)
+        if (!abs) abs = uniqueSidebarPath(host)
         if (!abs) return null
         const cwd = currentCwd()
         return cwd ? relPathOf(cwd, abs) : abs
+      } catch (e) {
+        return null
+      }
+    }
+
+    // 通用「带路径输入框的编辑器窗口」识别：不依赖 [data-dsh-better-sidebar]，
+    // 覆盖 better-sidebar 的原生标签页宿主、以及其它把 CM6 编辑器搬进宿主面板的布局。
+    // 从 CM6 编辑器容器逐层向上，取最近的一个「像文件路径」的 input[title]（限 12 层，避免误抓远处的输入框）。
+    function relPathFromEditorWindow(node) {
+      try {
+        const start = node && node.nodeType === 1 ? node : (node ? node.parentElement : null)
+        if (!start || !start.closest) return null
+        const editor = start.closest('.cm-editor, [class*="editorCm"], [class*="editorMd"]')
+        if (!editor) return null
+        let el = editor
+        for (let hops = 0; el && hops < 12; hops++) {
+          if (el.querySelector) {
+            const inputs = el.querySelectorAll('input[title]')
+            for (const inp of inputs) {
+              const t = String(inp.title || '')
+              if (isPathLikeTitle(t)) return normalizePreviewPath(t)
+            }
+          }
+          el = el.parentElement
+        }
+        return null
+      } catch (e) {
+        return null
+      }
+    }
+
+    // 全文档范围按路径输入框 title 找已挂载的 CM6 视图（jump-back 用）
+    function findViewByPathInput(absPath, root) {
+      try {
+        if (!absPath) return null
+        const scope = root || document
+        if (!scope || !scope.querySelectorAll) return null
+        const target = String(absPath || '').replace(/[\\/]+$/, '')
+        const base = basenameOf(target)
+        const inputs = scope.querySelectorAll('input[title]')
+        for (const inp of inputs) {
+          const t = String(inp.title || '').replace(/[\\/]+$/, '')
+          if (t === '') continue
+          const same = t.toLowerCase() === target.toLowerCase() || (base !== '' && basenameOf(t).toLowerCase() === base.toLowerCase())
+          if (!same) continue
+          let el = inp.parentElement
+          for (let hops = 0; el && hops < 10; hops++) {
+            const cm = el.querySelector ? el.querySelector('.cm-content') : null
+            if (cm) {
+              const tile = cm.cmTile || el.cmTile || null
+              const view = tile && tile.root ? tile.root.view : null
+              if (view && view.dom && view.dom.isConnected) return view
+            }
+            el = el.parentElement
+          }
+        }
+        return null
+      } catch (e) {
+        return null
+      }
+    }
+
+    // 从选区向上在侧栏内找最近的路径输入框（不依赖编辑器容器的类名）
+    function absPathFromSidebarAncestors(node, sidebarHost) {
+      try {
+        let el = node && node.nodeType === 1 ? node : (node ? node.parentElement : null)
+        while (el && el !== sidebarHost) {
+          if (el.querySelector) {
+            const inputs = el.querySelectorAll('input[title]')
+            for (const inp of inputs) {
+              const t = String(inp.title || '')
+              if (isPathLikeTitle(t)) return t
+            }
+          }
+          el = el.parentElement
+        }
+        return null
+      } catch (e) {
+        return null
+      }
+    }
+
+    // 路径输入框的 title 是否像一个文件路径（含盘符/分隔符/扩展名）
+    function isPathLikeTitle(t) {
+      return t !== '' && (isAbsPath(t) || /[\\/]/.test(t) || /\.[a-zA-Z0-9]{1,6}$/.test(t))
+    }
+
+    // 侧栏里只挂了一个文件时（最常见的场景），那个路径输入框就是当前文件；
+    // 有些布局把路径输入框放在共享的窗口头部，选区的祖先链上根本遇不到它。
+    function uniqueSidebarPath(sidebarHost) {
+      try {
+        if (!sidebarHost || !sidebarHost.querySelectorAll) return null
+        const found = []
+        for (const inp of sidebarHost.querySelectorAll('input[title]')) {
+          const t = String(inp.title || '')
+          if (!isPathLikeTitle(t)) continue
+          if (found.indexOf(t) === -1) found.push(t)
+        }
+        return found.length === 1 ? found[0] : null
       } catch (e) {
         return null
       }
@@ -693,6 +986,242 @@ window.__ModuleLoader__.load({
         return true
       } catch (e) {
         console.error('[file-quote] better-sidebar openFile 失败', e)
+        return false
+      }
+    }
+
+    // ============ DSH 右侧「文档预览」窗格兼容层（client-ui-sidebar-documentpreview） ============
+    // 该窗格既没有 workbench 的 [data-path]，也不用 CodeMirror：
+    //   窗格根：   [data-document-preview]（正文 [data-textpreview-body]）
+    //   文件路径： [data-textpreview-path]（PathLabel，title = 绝对路径/展示路径）
+    //   纯文本行： <div data-textpreview-line="N">，N 即 1-based 源码行号（懒加载页带绝对偏移）
+    //   代码高亮： [data-code-preview] → [data-code-block-content] → pre > span.line（文档序 = 行号，首行 = 1）
+    function previewRootOf(node) {
+      const start = node && node.nodeType === 1 ? node : (node ? node.parentElement : null)
+      if (!start || !start.closest) return null
+      const root = start.closest('[data-document-preview]')
+      if (root) return root
+      const body = start.closest('[data-textpreview-body]')
+      if (body) return body.parentElement || body
+      const label = start.closest('[data-textpreview-path]')
+      if (label && label.parentElement && label.parentElement.parentElement) return label.parentElement.parentElement
+      return null
+    }
+
+    function normalizePreviewPath(raw) {
+      const p = String(raw == null ? '' : raw).trim()
+      if (p === '') return null
+      const cwd = currentCwd()
+      if (isAbsPath(p)) return cwd ? relPathOf(cwd, p) : p
+      return p
+    }
+
+    // 选区在右侧文档预览窗格内 → 返回工作区相对路径（供引用块来源行）
+    function relPathFromDocumentPreview(node) {
+      try {
+        const root = previewRootOf(node)
+        if (!root || !root.querySelector) return null
+        const label = root.querySelector('[data-textpreview-path]')
+        if (!label) return null
+        return normalizePreviewPath(label.getAttribute('title') || label.textContent || '')
+      } catch (e) {
+        return null
+      }
+    }
+
+    // 预览窗格内某一节点所属的源码行号
+    function previewLineNumberOf(node) {
+      try {
+        if (!node) return null
+        const el = node.nodeType === 1 ? node : node.parentElement
+        if (!el || !el.closest) return null
+        const plain = el.closest('[data-textpreview-line]')
+        if (plain) {
+          const n = Number(plain.getAttribute('data-textpreview-line'))
+          if (Number.isFinite(n) && n >= 1) return n
+        }
+        const line = el.closest('.line')
+        if (line) {
+          const scope = line.closest('[data-code-block-content]') || line.closest('pre') || line.parentElement
+          if (scope && scope.querySelectorAll) {
+            const all = scope.querySelectorAll('.line')
+            const index = Array.prototype.indexOf.call(all, line)
+            if (index >= 0) return index + 1
+          }
+        }
+        return null
+      } catch (e) {
+        return null
+      }
+    }
+
+    // 选区端点常常落在容器元素上（跨块选择）：就近取一个子节点的行号
+    function previewLineNear(node, offset) {
+      let n = previewLineNumberOf(node)
+      if (n !== null) return n
+      if (!node || node.nodeType !== 1 || !node.childNodes) return null
+      const kids = node.childNodes
+      const at = Math.min(typeof offset === 'number' ? offset : kids.length, kids.length)
+      for (let i = at - 1; i >= 0; i--) {
+        n = previewLineNumberOf(kids[i])
+        if (n !== null) return n
+      }
+      for (let i = at; i < kids.length; i++) {
+        n = previewLineNumberOf(kids[i])
+        if (n !== null) return n
+      }
+      return null
+    }
+
+    function lineRangeFromDocumentPreview(range) {
+      try {
+        if (!range) return null
+        // 只在文档预览窗格内按 DOM 行号换算：别处（聊天里的代码块/差异卡片）的 .line
+        // 并不等于文件行号，按索引算会给出错误的行区间。
+        const startNode = range.startContainer
+        const startEl = startNode && startNode.nodeType === 1 ? startNode : (startNode ? startNode.parentElement : null)
+        if (!startEl || !startEl.closest) return null
+        if (!startEl.closest('[data-textpreview-body]') && !startEl.closest('[data-document-preview]')) return null
+        const a = previewLineNear(range.startContainer, range.startOffset)
+        const b = previewLineNear(range.endContainer, range.endOffset)
+        if (a === null && b === null) return null
+        const lo = a === null ? b : a
+        const hi = b === null ? a : b
+        return [Math.min(lo, hi), Math.max(lo, hi)]
+      } catch (e) {
+        return null
+      }
+    }
+
+    function previewRowsFor(body) {
+      try {
+        const plain = body.querySelectorAll('[data-textpreview-line]')
+        if (plain.length > 0) return plain
+        return body.querySelectorAll('.line')
+      } catch (e) {
+        return []
+      }
+    }
+
+    // 在预览正文里找引用的目标行：优先按已记录的行区间，其次按引用文本首行反查
+    function previewRowFor(body, text, lineRange) {
+      const rows = Array.prototype.slice.call(previewRowsFor(body))
+      if (rows.length === 0) return null
+      const numberAt = (row) => {
+        const attr = row.getAttribute ? row.getAttribute('data-textpreview-line') : null
+        return attr === null || attr === undefined ? null : Number(attr)
+      }
+      if (Array.isArray(lineRange) && lineRange.length === 2 && lineRange[0] >= 1) {
+        let first = null
+        let last = null
+        for (const row of rows) {
+          const n = numberAt(row)
+          if (n === lineRange[0]) first = row
+          if (n === lineRange[1]) last = row
+        }
+        if (!first && numberAt(rows[0]) === null) {
+          // 代码高亮模式没有行号属性：已加载页从第 1 行开始，按文档序取
+          const startIndex = lineRange[0] - 1
+          const endIndex = Math.min(lineRange[1] - 1, rows.length - 1)
+          if (startIndex >= 0 && startIndex < rows.length) first = rows[startIndex]
+          if (endIndex >= 0) last = rows[endIndex]
+        }
+        if (first) return { first, last: last || first }
+      }
+      const probe = String(text || '').trim()
+      if (probe === '') return null
+      const head = (probe.split('\n')[0] || '').trim()
+      const needles = head !== '' && head !== probe ? [probe, head] : [probe]
+      const parts = probe.split('\n').map((l) => l.trim()).filter((l) => l !== '')
+      const tail = parts.length > 0 ? parts[parts.length - 1] : head
+      for (const needle of needles) {
+        const hit = rows.findIndex((row) => (row.textContent || '').indexOf(needle) !== -1)
+        if (hit === -1) continue
+        let end = hit
+        for (let i = hit; i < rows.length; i++) {
+          if ((rows[i].textContent || '').indexOf(tail) !== -1) { end = i; break }
+        }
+        return { first: rows[hit], last: rows[end] }
+      }
+      return null
+    }
+
+    function flashPreviewRows(first, last) {
+      try {
+        const rows = []
+        let el = first
+        while (el) {
+          rows.push(el)
+          if (el === last) break
+          el = el.nextElementSibling
+        }
+        for (const row of rows) if (row.classList) row.classList.add('dsfq-line-flash')
+        setTimeout(() => { for (const row of rows) if (row.classList) row.classList.remove('dsfq-line-flash') }, 1800)
+      } catch (e) { /* ignore */ }
+    }
+
+    // 用 DOM Range 选中预览里的原文（不修改 DOM，避免干扰 React 渲染），并抑制批注气泡
+    function selectPreviewRowText(row, text) {
+      try {
+        const probe = String(text || '').trim()
+        if (!row || probe === '') return
+        const needle = (probe.split('\n')[0] || '').trim() || probe
+        const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT)
+        while (walker.nextNode()) {
+          const node = walker.currentNode
+          const content = node.textContent || ''
+          const at = content.indexOf(needle)
+          if (at === -1) continue
+          const range = document.createRange()
+          range.setStart(node, at)
+          range.setEnd(node, Math.min(at + needle.length, content.length))
+          const sel = window.getSelection()
+          if (sel) {
+            sel.removeAllRanges()
+            sel.addRange(range)
+          }
+          toolbarSuppressUntil = Date.now() + 3000
+          selectionStore.hide()
+          return
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    // 在已打开的右侧文档预览窗格里定位（滚动到目标行 + 高亮）——该窗格没有 CM6 视图可用
+    function locateInDocumentPreview(relPath, text, lineRange, pos) {
+      try {
+        if (!relPath) return false
+        const wanted = String(relPath).replace(/^[.][\\/]+/, '').toLowerCase()
+        const base = basenameOf(relPath).toLowerCase()
+        const labels = Array.prototype.slice.call(document.querySelectorAll('[data-textpreview-path]'))
+        // 先精确匹配相对路径，再退化到同名文件（同名只是兜底，绝不让它压过精确命中）
+        const rankOf = (label) => {
+          const panePath = normalizePreviewPath(label.getAttribute('title') || label.textContent || '')
+          if (!panePath) return null
+          const cand = String(panePath).replace(/^[.][\\/]+/, '').toLowerCase()
+          if (cand === wanted) return { label, panePath, rank: 0 }
+          if (base !== '' && basenameOf(panePath).toLowerCase() === base) return { label, panePath, rank: 1 }
+          return null
+        }
+        const hits = labels.map(rankOf).filter(Boolean).sort((a, b) => a.rank - b.rank)
+        if (hits.length === 0) return false
+        const label = hits[0].label
+        const root = label.closest('[data-document-preview]') || (label.parentElement && label.parentElement.parentElement) || label.parentElement
+        if (!root) return false
+        const body = root.querySelector('[data-textpreview-body]') || root
+        const row = previewRowFor(body, text, lineRange)
+        if (row) {
+          if (row.first.scrollIntoView) row.first.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          flashPreviewRows(row.first, row.last)
+          selectPreviewRowText(row.first, text)
+          showToast('已在右侧文档预览中定位并高亮 ✓', pos || lastPointerPos, true)
+          return true
+        }
+        if (body.scrollIntoView) body.scrollIntoView({ block: 'start' })
+        showToast('已切到文档预览「' + relPath + '」（未精确定位到原文行）', pos || lastPointerPos, true)
+        return true
+      } catch (e) {
+        console.error('[file-quote] 文档预览定位失败', e)
         return false
       }
     }
@@ -798,7 +1327,7 @@ window.__ModuleLoader__.load({
         const doc = view.state.doc
         const a = doc.lineAt(sel.from).number
         const b = doc.lineAt(sel.to).number
-        const abs = absPathForEditor(editor, host)
+        const abs = absPathForEditor(editor, host) || absPathFromSidebarAncestors(editor, host) || uniqueSidebarPath(host)
         if (!abs) return
         const cwd = currentCwd()
         const relPath = cwd ? relPathOf(cwd, abs) : abs
@@ -855,6 +1384,76 @@ window.__ModuleLoader__.load({
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+    // ============ 行区间兜底：界面本身给不出行号时（渲染型预览）用源码文本反查 ============
+    // 与 better-sidebar 的 linesOfSelection 同一策略：仅「唯一命中」才认行号，命中多处直接放弃。
+    function lineRangeFromSource(source, text) {
+      try {
+        const src = String(source || '')
+        let probe = String(text || '')
+        if (probe === '') return null
+        if (probe.endsWith('\n')) probe = probe.slice(0, -1)
+        if (probe === '') return null
+        const at = src.indexOf(probe)
+        if (at === -1) return null
+        if (src.indexOf(probe, at + 1) !== -1) return null
+        const lineAt = (index) => {
+          let line = 1
+          const end = Math.min(index, src.length)
+          for (let i = 0; i < end; i++) if (src[i] === '\n') line++
+          return line
+        }
+        return [lineAt(at), lineAt(at + Math.max(probe.length - 1, 0))]
+      } catch (e) {
+        return null
+      }
+    }
+
+    // 取文件源码：优先已挂载的 CM6 视图（better-sidebar 预览模式下编辑器只是隐藏），
+    // 否则走插件自身的读文件路由（host 侧读盘）。
+    async function sourceTextOf(relPath, cwd) {
+      try {
+        const view = findEditorViewByPath(relPath)
+        if (view && view.state && view.state.doc) return view.state.doc.toString()
+      } catch (e) { /* ignore */ }
+      if (!cwd) return null
+      try {
+        const url = '/dsh-file-quote/read?cwd=' + encodeURIComponent(cwd) + '&path=' + encodeURIComponent(relPath)
+        const res = await fetch(url)
+        const data = await res.json().catch(() => null)
+        if (data && data.ok && typeof data.text === 'string') return data.text
+      } catch (e) { /* ignore */ }
+      return null
+    }
+
+    async function backfillLineRange(item) {
+      if (!item || !item.relPath) return null
+      if (Array.isArray(item.lineRange) && item.lineRange.length === 2) return item.lineRange
+      const source = await sourceTextOf(item.relPath, item.cwd || currentCwd())
+      if (!source) return null
+      return lineRangeFromSource(source, item.text)
+    }
+
+    // 用 harness 官方资源通路在右侧文档预览里打开文件并跳转到指定行。
+    // 地址文法：dsh-resource://file/session/<sessionId>/<path>，行号经 navigation.params.line 传递
+    // （ui-sidebar-documentpreview 的 scrollToLine 消费它）。
+    function openInRightPreview(sessionId, relPath, line) {
+      try {
+        const sidebarRight = rootCtx && typeof rootCtx.get === 'function' ? rootCtx.get('sidebarRight') : null
+        if (!sidebarRight || typeof sidebarRight.openResource !== 'function') return false
+        const sid = sessionId || currentSessionId
+        if (!sid || !relPath) return false
+        const normalized = String(relPath).replace(/\\/g, '/').replace(/^(?:\.\/)+/, '')
+        const encoded = normalized.split('/').map((seg) => encodeURIComponent(seg).replace(/%3A/gi, ':')).join('/')
+        const address = 'dsh-resource://file/session/' + encodeURIComponent(sid) + '/' + encoded
+        const params = typeof line === 'number' && line >= 1 ? { line } : undefined
+        sidebarRight.openResource(address, params ? { params } : {})
+        return true
+      } catch (e) {
+        console.warn('[file-quote] 无法在右侧文档预览中打开文件：', relPath, e && e.message ? e.message : e)
+        return false
+      }
+    }
+
     // ============ 文件引用定位：优先编辑器内跳转，失败则浮层展示 ============
     async function locateFile(info, pos) {
       if (!info || !info.relPath) {
@@ -873,6 +1472,9 @@ window.__ModuleLoader__.load({
         showToast('已在侧边栏预览中定位并高亮 ✓', pos, true)
         return
       }
+      // 1.6 右侧「文档预览」窗格（ui-sidebar-documentpreview）：不是 CM6，
+      //      没有 [data-path]，靠窗格头部 PathLabel 认路径、靠 data-textpreview-line / pre .line 认行
+      if (locateInDocumentPreview(info.relPath, info.text, info.lineRange, pos)) return
       // 2. 文件已打开但未激活：点击 tab 激活后等待编辑器挂载再定位
       const base = basenameOf(info.relPath)
       if (base !== '' && clickTabByBase(base)) {
@@ -906,6 +1508,15 @@ window.__ModuleLoader__.load({
           showToast('已在侧边栏打开文件并定位 ✓', pos, true)
           return
         }
+      }
+      // 3.6 右侧文档预览窗格没打开这个文件：走官方资源通路（dsh-resource://file/…）
+      //      打开并带上行号，窗格自己会滚到目标行，随后我们补一次高亮
+      const targetLine = Array.isArray(info.lineRange) && info.lineRange.length === 2 ? info.lineRange[0] : null
+      if (openInRightPreview(info.sessionId, info.relPath, targetLine)) {
+        await sleep(500)
+        if (locateInDocumentPreview(info.relPath, info.text, info.lineRange, pos)) return
+        await sleep(500)
+        if (locateInDocumentPreview(info.relPath, info.text, info.lineRange, pos)) return
       }
       // 4. 兜底：浮层展示文件原文（host 读文件）
       if (!info.cwd) {
@@ -1037,8 +1648,11 @@ window.__ModuleLoader__.load({
     // ============ 组件二：选区浮动气泡（选中文字后出现，自动分流） ============
     const SelectionToolbar = (props) => {
       const sel = useSelection()
-      const current = typeof props.useSessions === 'function' ? props.useSessions((s) => s.current) : undefined
-      if (current !== undefined) currentSessionId = current
+      // 当前会话 id：走 slot 的 standard prop `useSessions`（harness 官方
+      // 取法见 pickCurrentSessionId），props 不可用时退回 sessions 服务快照。
+      const hooked = typeof props.useSessions === 'function' ? props.useSessions(pickCurrentSessionId) : undefined
+      const current = hooked === undefined || hooked === null ? currentSessionFallback() : hooked
+      if (current !== undefined && current !== null) currentSessionId = current
       if (!sel.visible || !sel.rect) return null
       const vw = typeof window !== 'undefined' ? window.innerWidth : 1024
       const est = Math.min(384, Math.max(120, sel.text.length * 13 + 76))
@@ -1061,7 +1675,11 @@ window.__ModuleLoader__.load({
             relPath: sel.relPath,
             anchorKey: sel.anchorKey,
             lineRange: sel.lineRange,
+            diag: sel.diag || '',
           }, sel.rect)
+          if (!sel.relPath && !sel.anchorKey && sel.diag) {
+            console.warn('[file-quote] 未识别到选区来源（该界面暂不支持引用定位）：', sel.diag)
+          }
         } else {
           showToast('没有活动会话，无法插入引用', { left: sel.rect.left, top: sel.rect.bottom + 12 }, false)
         }
@@ -1112,17 +1730,32 @@ window.__ModuleLoader__.load({
         if (top + 200 > vh) top = Math.max(8, vh - 220)
       }
       const rangeText = formatLineRange(state.item ? state.item.lineRange : null)
-      const insert = () => {
+      const insert = async () => {
         const item = state.item
         if (!item) return
         try {
           const c = (comment || '').trim()
+          // 渲染型预览（markdown/HTML）给不出 DOM 行号时，用源码文本反查补全行区间，
+          // 保证「> 📄 引用来源：路径（第 X-Y 行）」始终带精确行区间。
+          let lineRange = Array.isArray(item.lineRange) && item.lineRange.length === 2 ? item.lineRange : null
+          if (!lineRange && item.relPath) {
+            const found = await backfillLineRange(item)
+            // 等待期间用户关掉了批注框就不再插入
+            if (editorStore.item !== item) return
+            if (found) {
+              lineRange = found
+              editorStore.update({ lineRange })
+            }
+          }
           // 引用来源完全集成在引用块内（末行）：AI 可见路径与行区间，
           // 用户侧折叠后不显示来源（仅悬停时随引用块全文可见）
           let quoteBody = quoteBodyOf(item.text)
           if (item.relPath) {
-            const range = formatLineRange(item.lineRange)
+            const range = formatLineRange(lineRange)
             quoteBody = quoteBody + '\n> 📄 引用来源：' + item.relPath + (range !== '' ? '（' + range + '）' : '')
+          } else if (DIAGNOSE_IN_QUOTE && item.diag) {
+            // 认不出界面时，把祖先链随引用一起发出去（便于定位是哪一层 DOM）；默认关闭
+            quoteBody = quoteBody + '\n> ⚠️ 引用来源未识别（file-quote 诊断）：' + item.diag
           }
           // 引用块必须独占行（markdown `>` 行）：序列化文本自带首尾换行，
           // 与前后普通文本/其他引用分离，多个引用连续插入互不粘连。
@@ -1146,7 +1779,7 @@ window.__ModuleLoader__.load({
           const commentTail = c === '' ? '' : '\n\n' + c
           if (pipelineAvailable && typeof input.insertReference === 'function') {
             const ref = 'f' + (++refSeq)
-            const label = '引用#' + refSeq
+            const label = '引用内容 #' + refSeq
             const cwd = (sessions.list && sessions.list.getSnapshot && sessions.list.getSnapshot().byId && sessions.list.getSnapshot().byId[item.sessionId] && sessions.list.getSnapshot().byId[item.sessionId].cwd) || null
             refTargets.set(ref, {
               sessionId: item.sessionId,
@@ -1156,23 +1789,38 @@ window.__ModuleLoader__.load({
               text: item.text,
               body: quoteBodyClean,
               label,
-              lineRange: item.lineRange || null,
+              lineRange: lineRange || null,
             })
-            refCodecs.set(ref, { body: quoteBody, clipboardText: quoteBodyClean })
+            // 评论并入 chip 的序列化正文：提交时 chip 展开为「引用块 + 评论」，
+            // 不再在插入后调用 setDraft（那会用纯文本重写整份草稿，把 chip 抹掉）。
+            refCodecs.set(ref, { body: quoteBody + commentTail, clipboardText: quoteBodyClean + commentTail })
             if (refCodecs.size > 200) {
               const oldest = refCodecs.keys().next().value
               refCodecs.delete(oldest)
               refTargets.delete(oldest)
             }
-            const span = { start: st.draft.length, end: st.draft.length, draftRev: st.draftRev }
-            const applied = input.insertReference({ source: 'file-quote-ref', ref, label, clipboardText: quoteBodyClean }, span)
-            if (applied) {
-              if (commentTail !== '') {
-                const st3 = input.state.getSnapshot()
-                input.setDraft(st3.draft.replace(/[ \t]+$/, '') + commentTail)
+            // 插入位置取当前光标/选区（harness 的 caretSpan），
+            // 拿不到才退回草稿末尾——「任意位置插入、数量不限」由此生效。
+            let span = { start: st.draft.length, end: st.draft.length, draftRev: st.draftRev }
+            if (typeof input.caretSpan === 'function') {
+              const cs = input.caretSpan() || {}
+              const a = typeof cs.start === 'number' ? cs.start : st.draft.length
+              const b = typeof cs.end === 'number' ? cs.end : a
+              span = { start: Math.min(a, b), end: Math.max(a, b), draftRev: st.draftRev }
+            }
+            const refInfo = { source: 'file-quote-ref', ref, label, clipboardText: quoteBodyClean + commentTail }
+            let applied = typeof input.insertReference === 'function' ? input.insertReference(refInfo, span) === true : false
+            // 兜底：走 input-trigger 官方的事件通道（它自己就是这么插 chip 的），
+            // shell 没有该方法、或方法因 phase/rev 拒绝时再试一次。
+            if (!applied && binding.ctx && typeof binding.ctx.bail === 'function') {
+              try {
+                applied = binding.ctx.bail(binding.ctx, 'slash/input-insert-reference', { reference: refInfo, span }) === true
+              } catch (e) {
+                console.warn('[file-quote] 事件通道插入引用失败', e)
               }
+            }
+            if (applied) {
               setStatus({ ok: true, text: '已插入引用 #' + refSeq + ' ✓' })
-              console.log('[file-quote] 引用已插入', { ref, applied, relPath: item.relPath, anchorKey: item.anchorKey })
               editorStore.close()
               return
             }
@@ -1198,7 +1846,11 @@ window.__ModuleLoader__.load({
         React.createElement('div', { className: 'dsfq-editor-quote' }, state.item.text),
         React.createElement('div', { className: 'dsfq-editor-path' }, state.item.relPath
           ? '文件：' + state.item.relPath + (rangeText !== '' ? '（' + rangeText + '）' : '')
-          : (state.item.anchorKey ? '会话消息引用' : '未识别到定位信息')),
+          : (state.item.anchorKey
+            ? '会话消息引用'
+            : (DIAGNOSE_IN_QUOTE && state.item.diag
+              ? '未识别来源（诊断）：' + state.item.diag
+              : '未识别到定位信息（该界面暂不支持引用定位）'))),
         React.createElement('input', {
           ref: inputRef,
           className: 'dsfq-editor-input',
@@ -1288,30 +1940,19 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         const onOver = (e) => {
           try {
-            const el = e.target && e.target.closest ? e.target.closest('[data-occurrence], [data-dsfq-quote]') : null
+            const el = e.target && e.target.closest ? e.target.closest(CHIP_SELECTOR) : null
             if (!el) {
               tip.current.visible = false
               force((v) => v + 1)
               return
             }
-            let text = ''
-            if (el.hasAttribute('data-occurrence')) {
-              const occId = Number(el.getAttribute('data-occurrence'))
-              if (!Number.isFinite(occId)) return
-              const found = resolveOccurrence(occId)
-              if (!found || !found.info || !found.info.text) {
-                tip.current.visible = false
-                force((v) => v + 1)
-                return
-              }
-              text = found.info.text
-            } else {
-              text = el.getAttribute('data-dsfq-quote-text') || ''
-              if (!text) {
-                tip.current.visible = false
-                force((v) => v + 1)
-                return
-              }
+            // 三种 chip 形态统一解析（含新版输入框 chip data-composer-chip）
+            const found = quoteInfoFromChip(el)
+            const text = found ? found.text : ''
+            if (!text) {
+              tip.current.visible = false
+              force((v) => v + 1)
+              return
             }
             const r = el.getBoundingClientRect()
             tip.current = { visible: true, text, rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } }
@@ -1320,10 +1961,10 @@ window.__ModuleLoader__.load({
         }
         const onOut = (e) => {
           try {
-            const el = e.target && e.target.closest ? e.target.closest('[data-occurrence], [data-dsfq-quote]') : null
+            const el = e.target && e.target.closest ? e.target.closest(CHIP_SELECTOR) : null
             if (!el) return
             const next = e.relatedTarget
-            if (next && next.closest && next.closest('[data-occurrence], [data-dsfq-quote]')) return
+            if (next && next.closest && next.closest(CHIP_SELECTOR)) return
             tip.current.visible = false
             force((v) => v + 1)
           } catch (err) { /* ignore */ }
@@ -1406,8 +2047,9 @@ window.__ModuleLoader__.load({
 .dsfq-locator-code{flex:1;color:var(--dsw-alias-label-primary)}
 .dsfq-locator-mark{background:var(--dsw-alias-brand-primary);color:#fff;border-radius:3px;padding:0 2px}
 .dsfq-flash{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:4px;border-radius:8px}
+.dsfq-line-flash{background:var(--dsw-alias-interactive-bg-hover,rgba(99,160,255,.16))}
 .dsfq-cm-flash{background:var(--dsw-alias-brand-primary);color:#fff!important;border-radius:2px}
-[data-occurrence]{pointer-events:auto;cursor:pointer;position:relative;z-index:1}
+[data-occurrence],[data-composer-chip]{pointer-events:auto;cursor:pointer;position:relative;z-index:1}
 .dsfq-sent-quote{display:inline-block;box-sizing:border-box;max-width:100%;vertical-align:baseline;margin:1px 0;padding:2px 10px 2px 8px;border-left:3px solid var(--dsw-alias-brand-primary);border-radius:4px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
 .dsfq-sent-quote::before{content:"❝ "}
 `
@@ -1419,24 +2061,25 @@ window.__ModuleLoader__.load({
       if (slots === undefined) return
       ctx.effect(() => insertStyleSheet(css), 'dsh-file-quote: styles')
 
-      // 注册引用 source（提交时把占位符序列化为引用正文）
+      // 注册引用 source（提交时把占位符序列化为引用正文）。
+      // inputTriggers 由另一个插件提供，激活顺序不保证：本插件在 slots
+      // 就绪时就激活，此刻 inputTriggers 常常还没 ACTIVE，ctx.get 拿到 undefined，
+      // 于是兜底成纯文本、输入框侧永远不会出现 chip。改为：先即时试一次，
+      // 拿不到就交给 ctx.inject 等该服务就绪后再注册（cordis 的迟到依赖用法）。
       const inputTriggers = ctx.get('inputTriggers')
-      pipelineAvailable = !!(inputTriggers && typeof inputTriggers.registerSource === 'function')
-      if (pipelineAvailable) {
-        ctx.effect(() => inputTriggers.registerSource({
-          trigger: '@',
-          name: 'file-quote-ref',
-          order: 101,
-          candidates: async () => [],
-          onPick: () => undefined,
-          codec: {
-            clipboardText: (ref) => (refCodecs.get(ref) ? refCodecs.get(ref).clipboardText : ''),
-            serialize: (ref) => Promise.resolve(refCodecs.get(ref) ? refCodecs.get(ref).body : ''),
-          },
-        }), 'dsh-file-quote: file-quote-ref source')
-        console.log('[file-quote] 引用管线已注册')
+      if (inputTriggers !== undefined) {
+        const disposeSource = registerQuoteSource(inputTriggers)
+        if (disposeSource !== null) ctx.effect(() => disposeSource, 'dsh-file-quote: file-quote-ref source')
       } else {
-        console.warn('[file-quote] inputTriggers 服务不可用，引用功能将退化为纯文本')
+        let piped = false
+        ctx.inject(['inputTriggers'], (child) => {
+          if (piped) return
+          const svc = child.get('inputTriggers')
+          const disposeSource = registerQuoteSource(svc)
+          if (disposeSource === null) return
+          piped = true
+          child.effect(() => disposeSource, 'dsh-file-quote: file-quote-ref source')
+        })
       }
 
       // 全局选区监听：编辑区（contenteditable）→ 文件引用；非编辑区 → 消息引用
@@ -1501,15 +2144,35 @@ window.__ModuleLoader__.load({
               scheduleHide()
               return
             }
-            const relPath = relPathFromHost(host) || relPathFromBetterSidebar(host)
+            // 定位信息三路识别：workbench [data-path] / better-sidebar /
+            // 右侧文档预览窗格（最后一路是本版 harness 默认的「文件预览」界面）
             const anchorKey = anchorKeyFromHost(host)
-            const lineRange = lineRangeOfSelection(host, range)
+            let relPath = relPathFromHost(host) || relPathFromBetterSidebar(host) || relPathFromDocumentPreview(host) || relPathFromEditorWindow(host)
+            let lineRange = lineRangeOfSelection(host, range) || lineRangeFromDocumentPreview(range)
+            let diag = ''
+            if (!relPath && !anchorKey) {
+              // better-sidebar 的 CM6 会自己接管选区（pointerup 已写入定位信息），而随后的
+              // DOM selectionchange 可能既认不出界面也读不到 CM 选区 —— 同一段文本时保留旧结果，
+              // 否则会把刚拿到的 relPath 覆盖成 null。
+              const prevText = clipText(text, MAX_SELECTION)
+              if (selectionStore.visible && selectionStore.text === prevText && (selectionStore.relPath || selectionStore.anchorKey)) {
+                relPath = selectionStore.relPath
+                lineRange = lineRange || selectionStore.lineRange
+              } else {
+                diag = describeSurface(host)
+                if (diag !== lastUnrecognizedSurface) {
+                  lastUnrecognizedSurface = diag
+                  console.warn('[file-quote] 未识别到选区定位信息（该界面暂不支持文件/消息引用定位；如需适配请把这条日志发到插件仓库 issue）：', diag)
+                }
+              }
+            }
             selectionStore.show({
               text: clipText(text, MAX_SELECTION),
               rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
               relPath,
               anchorKey,
               lineRange,
+              diag,
             })
           } catch (e) {
             scheduleHide()
@@ -1530,36 +2193,21 @@ window.__ModuleLoader__.load({
         }
         const onChipPress = (e) => {
           try {
-            const el = e.target && e.target.closest ? e.target.closest('[data-occurrence], [data-dsfq-quote]') : null
+            lastPointerPos = { left: e.clientX, top: e.clientY }
+            const el = e.target && e.target.closest ? e.target.closest(CHIP_SELECTOR) : null
             if (!el) return
-            const pos = { left: e.clientX, top: e.clientY }
-            if (el.hasAttribute('data-occurrence')) {
-              // 输入框中的「引用#N」chip：走引用管线定位
-              const occId = Number(el.getAttribute('data-occurrence'))
-              if (!Number.isFinite(occId)) return
-              const found = resolveOccurrence(occId)
-              if (!found || !found.info) return
-              if (found.info.relPath) {
-                locateFile(found.info, pos)
-              } else if (found.info.anchorKey || found.info.body) {
-                locateMessage(found.info, pos)
-              } else {
-                showToast('该引用没有定位信息', pos, false)
-              }
+            const pos = lastPointerPos
+            // 输入框内的 chip 由 harness 的官方 chip 激活回调（source.openReference）
+            // 处理，这里让路，避免同一次点击被定位两次；回调不可用时才走 DOM 兜底。
+            if (el.hasAttribute('data-composer-chip') && quoteSourceRegistered) return
+            // 三种 chip 形态统一解析 + 统一定位路由
+            // （输入框 chip 由 data-composer-chip 承载，旧版 data-occurrence 仍兼容）
+            const found = quoteInfoFromChip(el)
+            if (!found) {
+              showToast('该引用没有定位信息', pos, false)
               return
             }
-            // 已发送消息的折叠引用块：从 chip 缓存解析定位信息
-            const relPath = el.getAttribute('data-dsfq-relpath') || ''
-            const body = el.getAttribute('data-dsfq-body') || ''
-            const rangeAttr = el.getAttribute('data-dsfq-range') || ''
-            const lineRange = rangeAttr ? rangeAttr.split(',').map(Number) : null
-            if (relPath) {
-              locateFile({ relPath, text: body, cwd: currentCwd(), lineRange }, pos)
-            } else if (body) {
-              locateMessage({ body }, pos)
-            } else {
-              showToast('该引用没有定位信息', pos, false)
-            }
+            locateQuoteTarget(found.info, pos)
           } catch (err) {
             showToast('定位出错：' + (err && err.message ? err.message : String(err)), { left: e.clientX, top: e.clientY }, false)
             console.error('[file-quote] 点击定位出错', err)
@@ -1631,6 +2279,10 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply
+    // 声明 slots 依赖：cordis 会等 ui-renderer 的 SlotRegistry 服务 ACTIVE 之后再执行 apply。
+    // 缺这一行时 apply 会在服务就绪前跑完并静默返回 —— 插件看起来「装上了但完全没反应」，
+    // 这正是 v0.1.0 的实际故障。
+    exports.inject = ['slots']
     return module.exports
   },
 })

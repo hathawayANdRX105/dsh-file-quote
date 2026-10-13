@@ -1,6 +1,6 @@
 {
   "name": "dsh-file-quote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unified quoting for DeepSeek Harness Web: select file-editor text or chat messages → annotate → 「引用#N」chip → the AI receives a formatted quote block with file path and exact line range (source line hidden on the user side); sent quotes collapse into a hoverable chip that jumps back to the original text. 统一引用插件（文件编辑器 + 会话消息）。",
   "keywords": [
     "dsh",

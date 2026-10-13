@@ -31,7 +31,7 @@
 
 ## 前置依赖
 
-DeepSeek Harness Web **0.1.x**（client 使用 `slots` / `inputTriggers` 服务；输入管线缺失时优雅降级为纯文本插入）。**[dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 推荐必装**：插件的**完整功能（侧边栏文件内容引用、跳回定位高亮）依赖它**——未安装时仅会话消息引用可用，文件引用退化为原文浮层展示。对应 DSH `0.1.0-rc.8` 及更高。
+DeepSeek Harness Web **0.1.x / 0.2.x**（client 使用 `slots` / `inputTriggers` 服务；输入管线缺失时优雅降级为纯文本插入）。已在 DSH `0.2.0-rc.2` 上实测。**[dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 推荐必装**：插件的**完整功能（侧边栏文件内容引用、跳回定位高亮）依赖它**——未安装时仅会话消息引用可用，文件引用退化为原文浮层展示。对应 DSH `0.1.0-rc.8` 及更高。
 
 ## 安装
 
@@ -51,6 +51,17 @@ dsh plugin --profile web add "link:your path/dsh-file-quote"
 ```
 
 装完硬刷新浏览器（Cmd/Ctrl+Shift+R）；host 半改动需重启 `dsh web`。
+
+### 更新到新版本
+
+```bash
+dsh plugin --profile web add dsh-file-quote@latest
+```
+
+然后**硬刷新浏览器**（Cmd/Ctrl+Shift+R）；client 半区改动经 DSH 热加载即可生效，无需重启 `dsh web`。
+
+> 已发送的旧引用块、输入框里的旧 chip 都是**插入时的快照**，无法追溯修复——升级后请重新划选插入一次来验证。
+> 若升级后仍无效果，先硬刷新（Ctrl+F5）排除旧代码缓存。
 
 ## 使用
 
