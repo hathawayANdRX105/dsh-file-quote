@@ -61,6 +61,42 @@ window.__ModuleLoader__.load({
     const MAX_SELECTION = 4000
     const MAX_QUOTE = 2000
 
+    // 输入框（composer）是 Lexical contenteditable：它的 DOM 选区就是用户的光标。
+    // 插件任何「清空 / 搬走全局选区」的动作都只在输入框不持有这份选区时才能做，
+    // 否则 Lexical 的选区会跟着变成 null 或落到别的窗格，用户回到输入框打第一个字时
+    // 会落到草稿开头、把整段草稿替换掉，或者干脆被吞掉。
+    function composerHoldsSelection() {
+      try {
+        const composer = document.querySelector('[data-composer-input]')
+        if (composer === null) return false
+        const active = document.activeElement
+        if (active instanceof Node && (active === composer || composer.contains(active))) return true
+        const sel = window.getSelection()
+        const node = sel && sel.rangeCount > 0 ? sel.anchorNode : null
+        return node !== null && (node === composer || composer.contains(node))
+      } catch (e) {
+        return false
+      }
+    }
+
+    // 程序化高亮：输入框持有选区时不能改用原生选区（那会把光标搬出输入框），
+    // 退化成给目标元素加一段临时背景——用户仍能看到高亮，光标留在原处。
+    function flashElementText(el) {
+      try {
+        if (!el || !el.classList) return
+        el.classList.add('dsfq-text-flash')
+        setTimeout(() => { if (el.classList) el.classList.remove('dsfq-text-flash') }, 1800)
+      } catch (e) { /* ignore */ }
+    }
+
+    // 插入结束后把光标交还输入框：插入是在批注框里发起的，输入框此刻没有焦点；
+    // 不交还的话用户回到输入框打第一个字时可能没有光标（字符落到草稿开头或被吞掉）。
+    function returnComposerCaret(input) {
+      try {
+        if (input && typeof input.focus === 'function') input.focus()
+      } catch (e) { /* ignore */ }
+    }
+
     // ============ 选区浮动气泡 store ============
     const selectionStore = {
       visible: false,
@@ -1172,6 +1208,12 @@ window.__ModuleLoader__.load({
           const content = node.textContent || ''
           const at = content.indexOf(needle)
           if (at === -1) continue
+          // 输入框持有光标时不搬动全局选区，改用临时背景高亮（见 composerHoldsSelection）。
+          if (composerHoldsSelection()) {
+            flashElementText(node.parentElement)
+            selectionStore.hide()
+            return
+          }
           const range = document.createRange()
           range.setStart(node, at)
           range.setEnd(node, Math.min(at + needle.length, content.length))
@@ -1287,6 +1329,11 @@ window.__ModuleLoader__.load({
         range.setEnd(targetNode, targetOffset + matchLen)
         const nodeEl = targetNode.parentElement
         if (nodeEl && nodeEl.scrollIntoView) nodeEl.scrollIntoView({ block: 'center', behavior: 'smooth' })
+        // 输入框持有光标时不搬动全局选区，改用临时背景高亮（见 composerHoldsSelection）。
+        if (composerHoldsSelection()) {
+          flashElementText(nodeEl)
+          return true
+        }
         const sel = window.getSelection()
         if (sel) {
           sel.removeAllRanges()
@@ -1661,8 +1708,12 @@ window.__ModuleLoader__.load({
       const top = sel.rect.top - 42 >= 8 ? sel.rect.top - 42 : sel.rect.bottom + 8
       const finish = () => {
         try {
-          const s = window.getSelection()
-          if (s && s.removeAllRanges) s.removeAllRanges()
+          // 输入框（Lexical contenteditable）持有选区时绝不清空全局选区：
+          // 那会把用户的光标一并清掉，之后第一个字符会落到草稿开头（见 composerHoldsSelection）。
+          if (!composerHoldsSelection()) {
+            const s = window.getSelection()
+            if (s && s.removeAllRanges) s.removeAllRanges()
+          }
         } catch (e) { /* ignore */ }
         selectionStore.hide()
       }
@@ -1799,14 +1850,18 @@ window.__ModuleLoader__.load({
               refCodecs.delete(oldest)
               refTargets.delete(oldest)
             }
-            // 插入位置取当前光标/选区（harness 的 caretSpan），
-            // 拿不到才退回草稿末尾——「任意位置插入、数量不限」由此生效。
+            // 插入位置取当前光标/选区（harness 的 caretSpan）。
+            // 输入框此刻不持有光标时（用户在批注框里），caretSpan 读到的是上一次的残留选区：
+            // 非折叠的残留选区会把整段草稿替换掉，所以只在光标真的在输入框里时才按选区替换，
+            // 否则把它收成插入点。拿不到时退回草稿末尾——「任意位置插入、数量不限」由此生效。
             let span = { start: st.draft.length, end: st.draft.length, draftRev: st.draftRev }
             if (typeof input.caretSpan === 'function') {
               const cs = input.caretSpan() || {}
               const a = typeof cs.start === 'number' ? cs.start : st.draft.length
               const b = typeof cs.end === 'number' ? cs.end : a
-              span = { start: Math.min(a, b), end: Math.max(a, b), draftRev: st.draftRev }
+              const lo = Math.min(a, b)
+              const hi = Math.max(a, b)
+              span = { start: lo, end: composerHoldsSelection() ? hi : lo, draftRev: st.draftRev }
             }
             const refInfo = { source: 'file-quote-ref', ref, label, clipboardText: quoteBodyClean + commentTail }
             let applied = typeof input.insertReference === 'function' ? input.insertReference(refInfo, span) === true : false
@@ -1822,6 +1877,7 @@ window.__ModuleLoader__.load({
             if (applied) {
               setStatus({ ok: true, text: '已插入引用 #' + refSeq + ' ✓' })
               editorStore.close()
+              returnComposerCaret(input)
               return
             }
             refTargets.delete(ref)
@@ -1833,6 +1889,7 @@ window.__ModuleLoader__.load({
             setStatus({ ok: false, text: '引用管线不可用，已插入纯文本引用' })
           }
           editorStore.close()
+          returnComposerCaret(input)
         } catch (e) {
           setStatus({ ok: false, text: '插入失败：' + (e && e.message ? e.message : String(e)) })
           console.error('[file-quote] 插入失败', e)
@@ -2049,6 +2106,7 @@ window.__ModuleLoader__.load({
 .dsfq-flash{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:4px;border-radius:8px}
 .dsfq-line-flash{background:var(--dsw-alias-interactive-bg-hover,rgba(99,160,255,.16))}
 .dsfq-cm-flash{background:var(--dsw-alias-brand-primary);color:#fff!important;border-radius:2px}
+.dsfq-text-flash{background:var(--dsw-alias-interactive-bg-hover,rgba(99,160,255,.28));border-radius:3px}
 [data-occurrence],[data-composer-chip]{pointer-events:auto;cursor:pointer;position:relative;z-index:1}
 .dsfq-sent-quote{display:inline-block;box-sizing:border-box;max-width:100%;vertical-align:baseline;margin:1px 0;padding:2px 10px 2px 8px;border-left:3px solid var(--dsw-alias-brand-primary);border-radius:4px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
 .dsfq-sent-quote::before{content:"❝ "}

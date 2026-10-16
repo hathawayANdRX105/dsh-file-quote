@@ -2,6 +2,26 @@
 
 All notable changes to dsh-file-quote.
 
+## [0.1.2] — 2026-10-16
+
+修复插件搬动全局选区导致输入框（composer）光标被破坏的问题（在 DSH `0.2.1-alpha.4` +
+真实 Chromium 上实测；输入框是 Lexical contenteditable，它的 DOM 选区就是用户的光标）：
+
+- **修复「点批注后第一个字落到草稿开头」** — `SelectionToolbar.finish()` 无条件
+  `window.getSelection().removeAllRanges()`，输入框持有光标时也照清不误：清完
+  `rangeCount` 为 0，Lexical 不会自己补回选区，下一个字符（含中文输入法预编辑）落到
+  草稿最开头（实测 `alpha beta gamma` → `Xalpha beta gamma`）。现在输入框持有选区时
+  不清空，只收起气泡。
+- **修复「打字被吞掉」** — `selectPreviewRowText()` / `highlightInMarkdownPreview()` 用
+  `removeAllRanges()` + `addRange()` 把全局选区搬到预览窗格；输入框此时仍持有焦点，
+  之后打字完全无效（实测连打两个字符草稿无变化）。现在输入框持有选区时改用临时背景
+  高亮（`.dsfq-text-flash`），光标留在原处。
+- **修复「整段草稿被替换」** — 插入引用时 `caretSpan()` 读到的是输入框上一次的残留选区；
+  光标不在输入框里（用户在批注框里）时，非折叠的残留选区会把整段草稿替换掉。现在只有
+  光标真的在输入框里才按选区替换，否则收成插入点。
+- **插入后把光标交还输入框** — 插入是在批注框里发起的，输入框此刻没有焦点；现在插入
+  成功或回退成纯文本后调用 `input.focus()`，用户可以接着打字。
+
 ## [0.1.1] — 2026-10-13
 
 修复「装了但完全没反应」以及文件引用缺失来源/行区间的问题（在 DSH `0.2.0-rc.2` + dsh-better-sidebar `0.25.0` 上实测）：
